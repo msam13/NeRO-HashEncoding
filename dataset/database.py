@@ -233,7 +233,18 @@ class GlossySyntheticDatabase(BaseDatabase):
         self.img_num = len(glob.glob(f'{self.root}/*.pkl'))
         self.img_ids= [str(k) for k in range(self.img_num)]
         self.cams = [read_pickle(f'{self.root}/{k}-camera.pkl') for k in range(self.img_num)]
-        self.scale_factor = 1.0
+        poses = []
+        for c in self.cams:
+            poses.append(c[0])
+            # break
+        poses  = np.array(poses)
+        print(np.min(poses[:,:,3]))
+        print(np.max(poses[:,:,3]))
+        scale_factor_for_ngp = np.max(poses[:,:,3]) - np.min(poses[:,:,3])
+
+        # input()
+
+        self.scale_factor = 1.0 / scale_factor_for_ngp #1.0
 
     def get_image(self, img_id):
         return imread(f'{self.root}/{img_id}.png')[...,:3]
@@ -245,18 +256,19 @@ class GlossySyntheticDatabase(BaseDatabase):
     def get_pose(self, img_id):
         pose = self.cams[int(img_id)][0].copy()
         pose = pose.astype(np.float32)
-        pose[:,3:] *= self.scale_factor
+        pose[:,3:] *= self.scale_factor 
+        # pose[:,3:] += 0.5
         return pose
 
     def get_img_ids(self):
         return self.img_ids
 
     def get_depth(self, img_id):
-        assert(self.scale_factor==1.0)
+        # assert(self.scale_factor==1.0)
         depth = imread(f'{self.root}/{img_id}-depth.png')
-        depth = depth.astype(np.float32) / 65535 * 15
-        mask = depth < 14.5
-        return depth, mask
+        depth = depth.astype(np.float32) / 65535 * 15 
+        mask = depth < 14.5 # * self.scale_factor
+        return depth* self.scale_factor, mask
 
     def get_mask(self, img_id):
         raise NotImplementedError
@@ -456,3 +468,4 @@ def get_database_eval_points(database):
         return np.asarray(downpcd.points,np.float32)
     else:
         raise NotImplementedError
+    
