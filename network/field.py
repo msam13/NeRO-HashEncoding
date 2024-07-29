@@ -9,6 +9,53 @@ from utils.base_utils import az_el_to_points, sample_sphere
 from utils.raw_utils import linear_to_srgb
 from utils.ref_utils import generate_ide_fn
 
+import commentjson as json
+import tinycudann as tcnn
+import torch
+
+
+with open("network/config_hash.json") as f:
+	config = json.load(f)
+
+
+class SineLayer(nn.Module):
+    # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of omega_0.
+    
+    # If is_first=True, omega_0 is a frequency factor which simply multiplies the activations before the 
+    # nonlinearity. Different signals may require different omega_0 in the first layer - this is a 
+    # hyperparameter.
+    
+    # If is_first=False, then the weights will be divided by omega_0 so as to keep the magnitude of 
+    # activations constant, but boost gradients to the weight matrix (see supplement Sec. 1.5)
+    
+    def __init__(self, in_features, out_features, bias=True,
+                 is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        self.init_weights()
+    
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 
+                                             1 / self.in_features)      
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
+                                             np.sqrt(6 / self.in_features) / self.omega_0)
+        
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
+    
+    def forward_with_intermediate(self, input): 
+        # For visualization of activation distributions
+        intermediate = self.omega_0 * self.linear(input)
+        return torch.sin(intermediate), intermediate
+
 
 # Positional encoding embedding. Code was taken from https://github.com/bmild/nerf.
 class Embedder:
@@ -20,9 +67,32 @@ class Embedder:
         embed_fns = []
         d = self.kwargs['input_dims']
         out_dim = 0
+        
         if self.kwargs['include_input']:
             embed_fns.append(lambda x: x)
             out_dim += d
+
+        class Hash_encoding():
+            def __init__(self, input_dim):
+                self.input_dim = input_dim
+                encoding = tcnn.Encoding(input_dim, config["encoding"])
+                self.embed_fn_fine = torch.nn.Sequential(encoding)
+                self.tcnn_out_dim = encoding.n_output_dims
+
+
+            def __call__(self, x):
+                reshaped_inp = torch.reshape(x, (-1,self.input_dim ))
+                # print("reshaped_inp ",reshaped_inp.shape)
+                # print("out_dim ",self.tcnn_out_dim)
+                hash_rep = self.embed_fn_fine(reshaped_inp)
+                # print("hash_rep: ", hash_rep.shape)
+                output = hash_rep.view(*x.shape[:-1], self.tcnn_out_dim)
+                return output
+        
+        hash_encoding = Hash_encoding(d)
+        embed_fns.append(hash_encoding)
+        out_dim += hash_encoding.tcnn_out_dim
+
 
         max_freq = self.kwargs['max_freq_log2']
         N_freqs = self.kwargs['num_freqs']
@@ -39,9 +109,12 @@ class Embedder:
 
         self.embed_fns = embed_fns
         self.out_dim = out_dim
+        # print("self.out_dim ", self.out_dim )
+
 
     def embed(self, inputs):
-        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+        og = torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+        return og
 
 def get_embedder(multires, input_dims=3):
     embed_kwargs = {
@@ -82,6 +155,12 @@ class SDFNetwork(nn.Module):
             embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
             self.embed_fn_fine = embed_fn
             dims[0] = input_ch
+            # print(f"d_in ", d_in)
+            # print(f"multires ", multires)
+            # encoding = tcnn.Encoding(d_in, config["encoding"])
+            # self.embed_fn_fine = torch.nn.Sequential(encoding)
+            # print(f"encoding.n_output_dims ", encoding.n_output_dims)
+            # dims[0] = encoding.n_output_dims
 
         self.num_layers = len(dims)
         self.skip_in = skip_in
@@ -93,9 +172,14 @@ class SDFNetwork(nn.Module):
             else:
                 out_dim = dims[l + 1]
 
-            lin = nn.Linear(dims[l], out_dim)
+            SINE_LAYER = False
+            if not SINE_LAYER:
+                lin = nn.Linear(dims[l], out_dim)
+            else:
+                lin = SineLayer(dims[l], out_dim)
 
-            if geometric_init:
+
+            if geometric_init and not SINE_LAYER:
                 if l == self.num_layers - 2:
                     if not inside_outside:
                         torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
@@ -115,24 +199,39 @@ class SDFNetwork(nn.Module):
                     torch.nn.init.constant_(lin.bias, 0.0)
                     torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
 
-            if weight_norm:
+            if weight_norm and not SINE_LAYER:
                 lin = nn.utils.weight_norm(lin)
 
             setattr(self, "lin" + str(l), lin)
 
+        # layer_activation='sine'
         if layer_activation=='softplus':
             self.activation = nn.Softplus(beta=100)
         elif layer_activation=='relu':
             self.activation = nn.ReLU()
+        elif layer_activation=='sine':
+            self.activation  = torch.sin
         else:
             raise NotImplementedError
 
     def forward(self, inputs):
         inputs = inputs * self.scale
         if self.embed_fn_fine is not None:
+            # print(f"nputs.shap ", inputs.shape)
             inputs = self.embed_fn_fine(inputs)
 
+
+            # inps = []
+            # for batch in inputs:
+            #     # print("batch.shape: ",batch.shape)
+            #     outputs = self.embed_fn_fine(batch)
+            #     outputs = outputs.detach().cpu().numpy()
+
+            #     inps.append(outputs)
+        
+        # inputs = torch.tensor(inps,device="cuda", dtype=torch.float32)
         x = inputs
+        # print("x.shape ", x.shape)
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
 
@@ -223,22 +322,36 @@ class NeRFNetwork(nn.Module):
         self.embed_fn = None
         self.embed_fn_view = None
 
+        
+
         if multires > 0:
             embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
             self.embed_fn = embed_fn
             self.input_ch = input_ch
+            # encoding = tcnn.Encoding(d_in, config["encoding"])
+            # self.embed_fn = encoding
+            # self.input_ch = encoding.n_output_dims
 
         if multires_view > 0:
             embed_fn_view, input_ch_view = get_embedder(multires_view, input_dims=d_in_view)
             self.embed_fn_view = embed_fn_view
             self.input_ch_view = input_ch_view
+            # encoding = tcnn.Encoding(d_in_view, config["encoding"])
+            # self.embed_fn_view = encoding
+            # self.input_ch_view = encoding.n_output_dims
 
         self.skips = skips
         self.use_viewdirs = use_viewdirs
 
+        SINE_LAYER = False
+        if SINE_LAYER==True:
+            layerType = SineLayer
+        else:
+            layerType = nn.Linear
+
         self.pts_linears = nn.ModuleList(
             [nn.Linear(self.input_ch, W)] +
-            [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + self.input_ch, W) for i in range(D - 1)])
+            [layerType(W, W) if i not in self.skips else layerType(W + self.input_ch, W) for i in range(D - 1)])
 
         ### Implementation according to the official code release
         ### (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
@@ -257,6 +370,7 @@ class NeRFNetwork(nn.Module):
 
     def forward(self, input_pts, input_views):
         if self.embed_fn is not None:
+            # for i in input_pts:
             input_pts = self.embed_fn(input_pts)
         if self.embed_fn_view is not None:
             input_views = self.embed_fn_view(input_views)
